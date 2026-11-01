@@ -1,10 +1,12 @@
 """A layout the chain planner finds is one the allocator can reach.
 
 Random histories leave holes in every band, pending pages in lazy ends, pins
-on some bands and fixed pages in others. Whenever `feasible` admits a demand,
-the least rearrangement serving it must realize: every live page keeps its
-bytes under its virtual id, every fixed page stays where it is, no two bands'
-pages share a byte, and each band takes exactly its demand.
+on some bands, fixed pages in others and network transfers on live pages.
+Whenever `feasible` admits a demand, the least rearrangement serving it must
+realize: every live page keeps its bytes under its virtual id, every fixed
+page stays where it is, no two bands' pages share a byte, and each band takes
+exactly its demand. Chains range over two ends, one float between them, and
+several window floats with or without a state end.
 """
 
 import random
@@ -17,6 +19,16 @@ import torch
 
 from sglang.srt.mem_cache.kv.alloc.pricing import feasible, first_plan
 from sglang.srt.mem_cache.kv.alloc.signals import CompletionFlags, TransferRelease
+from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+from sglang.srt.mem_cache.kv.decl import (
+    MHAGeometry,
+    StateGeometry,
+    WindowLayers,
+    kv_layer_decls,
+)
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -69,6 +81,58 @@ def _allocator(device, chain, lazy):
         **(state if chain == "tri" else {}),
     )
     return bundle.token_to_kv_pool_allocator
+
+
+_MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.float16)
+
+
+def _several_floats(device, windows, state, lazy):
+    """full + several window floats, with a state end below them or not."""
+    first_window = 2 if state else 1
+    decls = kv_layer_decls(
+        full_layer_ids=(0,),
+        full_geometry=_MHA,
+        windows=[
+            WindowLayers(layer_ids=(first_window + i,), geometry=_MHA, window=w)
+            for i, w in enumerate(windows)
+        ],
+        state_layer_ids=(1,) if state else (),
+        state_geometry=(
+            StateGeometry(
+                conv_state_shapes=((3, 8),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(1, 4, 8),
+                temporal_dtype=torch.float32,
+            )
+            if state
+            else None
+        ),
+        checkpoint_interval=mamba_cache_chunk_size() if state else None,
+    )
+    plan = plan_kv_storage(decls, page_size=1)
+    sized = size_plan(
+        plan,
+        KVSizingInputs(
+            full_tokens=48,
+            window_tokens=24,
+            state_slots=8 if state else 0,
+            max_running_requests=4,
+            context_len=64,
+            alignment=1,
+        ),
+    )
+    ctx = UnifiedBuildContext(
+        device=device,
+        start_layer=0,
+        end_layer=first_window + len(windows),
+        enable_memory_saver=False,
+        need_sort=False,
+        max_num_reqs=4,
+        model_context_len=64,
+        lazy_compaction=lazy,
+        state_cache_params=SimpleNamespace(layers=(1,)) if state else None,
+    )
+    return build_kv_storage(plan, sized, ctx).allocator
 
 
 def _live_bytes(allocator):
@@ -127,10 +191,15 @@ class TestChainRealize(CustomTestCase):
                 got = allocator.alloc_state_slots(1)
                 if got is not None:
                     slots.append(got)
+        windows = sorted(getattr(allocator, "window_allocators", None) or ())
         for ids in held:
             choice = rng.random()
             if choice < 0.3:
                 allocator.free(ids)
+            elif choice < 0.5 and len(windows) > 1:
+                allocator.free_window(
+                    rng.choice(windows), ids[: rng.randint(1, ids.numel())]
+                )
             elif choice < 0.5 and allocator.swa_attn_allocator is not None:
                 allocator.free_swa(ids[: rng.randint(1, ids.numel())])
         for slot in slots:
@@ -177,6 +246,76 @@ class TestChainRealize(CustomTestCase):
             for (_, end, a), (start, _, b) in zip(ranges, ranges[1:]):
                 self.assertLessEqual(end, start, (a, b))
         self.assertGreater(refused, 0)
+
+    def _check_several_floats(self, device, seed, count):
+        # Two or three window floats between the owner's end and a state end
+        # (or none), with transfers on live pages finishing while the
+        # rearrangement waits for them.
+        rng = random.Random(seed)
+        flags = CompletionFlags(num_slots=64, device_mapped=device == "cuda")
+        shapes = (
+            ((32, 16), False),
+            ((32, 16, 8), False),
+            ((32, 16), True),
+            ((32, 16, 8), True),
+        )
+        realized = refused = 0
+        floats = set()
+        while realized < count:
+            setup_allocator_context()
+            windows, state = shapes[realized % len(shapes)]
+            allocator = _several_floats(device, windows, state, rng.random() < 0.8)
+            raw = allocator.arena.raw
+            raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
+            self._history(rng, allocator)
+            running = []
+            for band in allocator.bands:
+                live = _live_pages(band)
+                if live and rng.random() < 0.4:
+                    flag = flags.acquire()
+                    running.append(flag)
+                    band.record_transfer(
+                        flag,
+                        rng.sample(live, min(len(live), 3)),
+                        writes=rng.random() < 0.5,
+                        release=TransferRelease(),
+                        unit_tokens=band.pool_page_size,
+                    )
+            snapshot = allocator.pricing_snapshot()
+            demands = {b.name: rng.choice((0, 1, 2, 4, 8, 16)) for b in snapshot.bands}
+            if not feasible(snapshot, demands):
+                refused += 1
+                for flag in running:
+                    flag.publish()
+                    flags.release(flag)
+                continue
+            growth = {b.name: rng.choice((0, 1, 2)) for b in snapshot.bands}
+            before = _live_bytes(allocator)
+            fixed = _fixed(allocator)
+            done = threading.Thread(
+                target=lambda: (time.sleep(0.01), [f.publish() for f in running])
+            )
+            done.start()
+            taken = allocator.realize(first_plan(snapshot, demands, growth=growth))
+            done.join()
+            for flag in running:
+                flags.release(flag)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            realized += 1
+            floats.add((windows, state))
+            self.assertEqual(_fixed(allocator), fixed)
+            after = _live_bytes(allocator)
+            self.assertEqual(before.keys(), after.keys())
+            for key, payload in before.items():
+                self.assertTrue(torch.equal(payload, after[key]), key)
+            for name, pages in demands.items():
+                self.assertEqual(0 if name not in taken else taken[name].numel(), pages)
+            ranges = _page_bytes(allocator, taken)
+            for (_, end, a), (start, _, b) in zip(ranges, ranges[1:]):
+                self.assertLessEqual(end, start, (a, b))
+        self.assertGreater(refused, 0)
+        self.assertEqual(floats, set(shapes))
 
     def test_a_load_reservation_is_fixed_until_submitted_or_cancelled(self):
         # A HiCache load reserves window pages before its copy is submitted;
@@ -353,6 +492,13 @@ class TestChainRealize(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_capacity_answers_are_takes_on_cuda(self):
         self._check_answers_are_takes("cuda", seed=12, count=80)
+
+    def test_feasible_demands_realize_with_several_floats_on_cpu(self):
+        self._check_several_floats("cpu", seed=41, count=400)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_feasible_demands_realize_with_several_floats_on_cuda(self):
+        self._check_several_floats("cuda", seed=42, count=60)
 
     def test_feasible_demands_realize_on_cpu(self):
         self._check("cpu", seed=7, count=800)
