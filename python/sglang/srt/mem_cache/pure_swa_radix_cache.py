@@ -49,9 +49,9 @@ class PureSWARadixCache(RadixCache):
         pass
 
     def evict(self, params: EvictParams) -> EvictResult:
-        """For all-SWA models, evict_from_tree_cache passes swa_num_tokens
-        (with num_tokens=0). Use whichever is non-zero."""
-        num_tokens = max(params.num_tokens, params.swa_num_tokens)
+        """An all-SWA model keeps one pool: window tokens and tokens are
+        evicted from it alike."""
+        num_tokens = max(params.num_tokens, *params.window_num_tokens.values(), 0)
         return super().evict(EvictParams(num_tokens=num_tokens))
 
     def available_and_evictable_str(self) -> str:
