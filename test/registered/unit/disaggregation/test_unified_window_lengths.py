@@ -20,6 +20,11 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     alloc_for_decode_prealloc,
 )
+from sglang.srt.disaggregation.utils import (
+    check_state_wire,
+    retained_window_lengths,
+    state_wire,
+)
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
@@ -78,9 +83,10 @@ def _window_sub_pools(storage):
     return [e.sub_pool for e in storage.wire_entries()]
 
 
-def _prefill_pages(storage, seq_len):
+def _prefill_pages(storage, seq_len, reaches=None):
     """The pages a prefill sends per window entry for a ``seq_len`` request
     that decode holds no prefix of."""
+    kept = retained_window_lengths(storage.allocator, reaches, _TARGET_WINDOW)
     req = SimpleNamespace(kv=ReqKvInfo())
     row = storage.acquire([req])[0]
     tokens = storage.allocator.alloc(-(-seq_len // _PAGE) * _PAGE)
@@ -88,7 +94,11 @@ def _prefill_pages(storage, seq_len):
     pages = {
         sub_pool: len(
             storage.resume_units(
-                sub_pool, req, token_start=0, token_boundary=seq_len
+                sub_pool,
+                req,
+                token_start=0,
+                token_boundary=seq_len,
+                retain=kept.get(sub_pool),
             ).unit_ids
         )
         for sub_pool in _window_sub_pools(storage)
@@ -114,7 +124,7 @@ class _HostPool:
         pass
 
 
-def _host_receive_queue(storage, sliding_window_size):
+def _host_receive_queue(storage, sliding_window_size, reaches=None):
     sub_pools = _window_sub_pools(storage)
     window_pools = {name: _HostPool() for name in sub_pools}
     queue = SimpleNamespace(
@@ -128,7 +138,7 @@ def _host_receive_queue(storage, sliding_window_size):
         host_window_entries=[
             (name, window_pools[name], 0, window)
             for name, window in DecodePreallocQueue._window_lengths_of(
-                storage, sliding_window_size
+                storage, sliding_window_size, reaches
             ).items()
         ],
         scheduler=SimpleNamespace(
@@ -169,6 +179,63 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     )
                 }
                 self.assertEqual(received, sent)
+
+    def test_a_reader_reaching_further_back_widens_what_both_peers_carry(self):
+        """A fused draft reading front rows before its window widens the tail
+        a request keeps of that window. The prefill sends that tail and the
+        decode receives all of it; peers keeping different tails refuse to
+        pair."""
+        storage = _storage()
+        reaches = {"window_8": 13}
+        self.assertEqual(
+            retained_window_lengths(storage.allocator, reaches, _TARGET_WINDOW),
+            {"window_16": 16, "window_8": 13, "window_4": 4},
+        )
+        for seq_len in (5, 23, 37, 64):
+            with self.subTest(seq_len=seq_len):
+                sent = _prefill_pages(storage, seq_len, reaches)
+                self.assertEqual(
+                    sent["window_8"],
+                    -(-seq_len // _PAGE) - max(0, seq_len - 13) // _PAGE,
+                )
+                queue, _ = _host_receive_queue(storage, _TARGET_WINDOW, reaches)
+                req = SimpleNamespace(
+                    origin_input_ids=array("q", [1] * seq_len), kv=ReqKvInfo()
+                )
+                with patch(
+                    "sglang.srt.disaggregation.decode.get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_decode_enable_radix_cache=False
+                    ),
+                ):
+                    self.assertTrue(
+                        DecodePreallocQueue._pre_alloc_host(
+                            queue, SimpleNamespace(req=req)
+                        )
+                    )
+                state_indices = queue._send_kv_metadata.call_args.args[3]
+                received = {
+                    name: len(pages)
+                    for (name, *_), pages in zip(
+                        queue.host_window_entries, state_indices
+                    )
+                }
+                self.assertEqual(received, sent)
+
+        def wire(tails):
+            kv_args = SimpleNamespace(
+                state_types=["swa"] * 3,
+                state_sub_pools=list(tails),
+                state_window_tails=list(tails.values()),
+            )
+            return state_wire(kv_args)
+
+        widened = wire({"window_16": 16, "window_4": 4, "window_8": 13})
+        check_state_wire(widened, widened)
+        with self.assertRaisesRegex(RuntimeError, "window tail"):
+            check_state_wire(
+                widened, wire({"window_16": 16, "window_4": 4, "window_8": 8})
+            )
 
     def test_checksum_digests_each_window_entry_by_its_own_rows(self):
         storage = _storage()

@@ -300,17 +300,43 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
     return int.from_bytes(raw, "big") >> 1 | 1
 
 
+def retained_window_lengths(
+    allocator, reaches: Optional[Dict[str, int]], unstated: Optional[int]
+) -> Dict[str, int]:
+    """The tail of each window sub-pool a running request keeps, by name: its
+    window, widened by a reader reaching further back (a fused draft's front
+    rows). The prefix cache retains, backs up and restores this much of a
+    request's window, so a PD peer sends it and a decode node binds and
+    receives all of it. A static pool's single window goes by ``unstated``,
+    as does a unified window that states no length."""
+    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+
+    storage = getattr(allocator, "storage", None)
+    if storage is not None:
+        lengths = storage.window_lengths(unstated)
+    elif unstated is not None:
+        lengths = {window_sub_pool_of(allocator): unstated}
+    else:
+        lengths = {}
+    reaches = reaches or {}
+    return {name: max(window, reaches.get(name, 0)) for name, window in lengths.items()}
+
+
 def state_wire(kv_args: KVArgs) -> Optional[List[List[Optional[str]]]]:
     """The state entries a PD peer registers, in order, as (state type,
-    sub-pool) pairs: two peers transfer state entry by entry, so theirs must
-    be equal. None when the peer registered no state entries yet."""
+    sub-pool) pairs, with the tail a window entry carries when the peer
+    states it: two peers transfer state entry by entry, page by page, so
+    theirs must be equal. None when the peer registered no state entries
+    yet."""
     state_types = getattr(kv_args, "state_types", None)
     if state_types is None:
         return None
     sub_pools = getattr(kv_args, "state_sub_pools", None) or [None] * len(state_types)
+    tails = getattr(kv_args, "state_window_tails", None) or [None] * len(state_types)
     return [
         [_wire_state_type(state_type).value, sub_pool]
-        for state_type, sub_pool in zip(state_types, sub_pools)
+        + ([] if tail is None else [tail])
+        for state_type, sub_pool, tail in zip(state_types, sub_pools, tails)
     ]
 
 
@@ -323,9 +349,10 @@ def check_state_wire(
         return
     raise RuntimeError(
         f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
-        f"decode server registers {decode_wire} (state type, sub-pool). Both "
-        "servers must hold the same attention and state sub-pools (model, window "
-        "lengths, draft model and unified memory settings)."
+        f"decode server registers {decode_wire} (state type, sub-pool, window "
+        "tail). Both servers must hold the same attention and state sub-pools "
+        "(model, window lengths, draft model and its front rows, unified memory "
+        "settings)."
     )
 
 
@@ -1546,9 +1573,11 @@ def setup_state_kv_args(
     storage: KVStorage | StaticKVStorage,
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
+    window_tails: Optional[Dict[str, int]] = None,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
-    peers read from its token KV layout."""
+    peers read from its token KV layout. ``window_tails`` gives the tail each
+    window sub-pool carries (`retained_window_lengths`); peers agree on it."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1590,6 +1619,10 @@ def setup_state_kv_args(
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout
+    kv_args.state_window_tails = [
+        (window_tails or {}).get(sub_pool) if sub_pool is not None else None
+        for sub_pool in kv_args.state_sub_pools
+    ]
     # MLA token KV beside recurrent state.
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
