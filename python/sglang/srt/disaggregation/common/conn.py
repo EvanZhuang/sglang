@@ -46,9 +46,11 @@ from sglang.srt.disaggregation.common.bootstrap import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    check_state_wire,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    state_wire,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -130,6 +132,10 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
+    # The state entries every prefill rank registers, as (state type, sub-pool)
+    # pairs; None when the ranks register different ones (PP stages that hold
+    # different sub-pools) or do not report them.
+    state_wire: Optional[List[List[Optional[str]]]] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
@@ -1392,6 +1398,8 @@ class CommonKVManager(BaseKVManager):
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
 
+        check_state_wire(info.state_wire, state_wire(self.kv_args))
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1634,6 +1642,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "state_wire": state_wire(self.kv_args),
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
@@ -3067,6 +3076,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.state_wire: Optional[list] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3154,6 +3164,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
         self.dsv41_spec_layout = dsv41_spec_layout
         self.decode_allocation_policy = policy
+        rank_state_wire = data.get("state_wire")
+        if not self._registered_count:
+            self.state_wire = rank_state_wire
+        elif self.state_wire != rank_state_wire:
+            self.state_wire = None
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -3255,6 +3270,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                state_wire=self.state_wire,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3270,6 +3286,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("dsv41_spec_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            if info.state_wire is None:
+                payload.pop("state_wire")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
