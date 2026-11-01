@@ -84,11 +84,11 @@ class TestPlanNames(CustomTestCase):
 
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
-            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "SWA")),
+            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "WINDOW_32")),
             "mamba": (("full", "kv", "FULL"), ("mamba", "mamba", "MAMBA")),
             "tri": (
                 ("full", "kv", "FULL"),
-                ("window_32", "swa", "SWA"),
+                ("window_32", "swa", "WINDOW_32"),
                 ("mamba", "mamba", "MAMBA"),
             ),
         }
@@ -123,9 +123,9 @@ class TestPlanNames(CustomTestCase):
         # each with its sub-pool's family, in the order it drives their eviction
         # (owner, window, state).
         expected = {
-            "swa": (("FULL", "token"), ("SWA", "window")),
+            "swa": (("FULL", "token"), ("WINDOW_32", "window")),
             "mamba": (("FULL", "token"), ("MAMBA", "state")),
-            "tri": (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
+            "tri": (("FULL", "token"), ("WINDOW_32", "window"), ("MAMBA", "state")),
         }
         for name, slots in expected.items():
             with self.subTest(chain=name):

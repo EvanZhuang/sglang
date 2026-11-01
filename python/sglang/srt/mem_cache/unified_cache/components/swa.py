@@ -81,10 +81,12 @@ class SWAComponent(TreeComponent):
             raise ValueError("SWAComponent requires a positive window in its slot")
 
         super().__init__(cache, params, slot)
+        # The host pool of the slot's HiCache copies; None when host stores
+        # have no pool for it.
         self.pool_name = (
-            PoolName.AUXILIARY_SWA
-            if self.component_type == ComponentType.AUXILIARY_SWA
-            else PoolName.SWA
+            PoolName.SWA
+            if slot.host_pool is None
+            else PoolName._value2member_map_.get(slot.host_pool)
         )
         self._independent = (
             sum(slot.family == "window" for slot in params.tree_slots) > 1
@@ -345,8 +347,13 @@ class SWAComponent(TreeComponent):
                 break
             node = node.parent
 
-        if ct == ComponentType.AUXILIARY_SWA:
-            return result._replace(auxiliary_swa_host_hit_length=swa_host_hit)
+        if ct != ComponentType.SWA:
+            return result._replace(
+                window_host_hit_lengths={
+                    **result.window_host_hit_lengths,
+                    ct: swa_host_hit,
+                }
+            )
         return result._replace(
             swa_host_hit_length=swa_host_hit,
             swa_branching_seqlen=branching_seqlen,

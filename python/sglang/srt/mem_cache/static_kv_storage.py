@@ -373,16 +373,11 @@ class StaticKVStorage:
 
     # -- what the prefix tree's effects reach --
 
-    # A second window component (buffer mode's) reaches the same window rows.
-    _TREE_SUB_POOLS = {
-        "FULL": "kv",
-        "SWA": "swa",
-        "AUXILIARY_SWA": "swa",
-        "MAMBA": "mamba",
-    }
+    _TREE_SUB_POOLS = {"FULL": "kv", "SWA": "swa", "MAMBA": "mamba"}
 
-    def tree_sub_pool(self, component: str) -> str:
-        return self._TREE_SUB_POOLS[component]
+    def tree_sub_pool(self, component) -> str:
+        # A further window component reaches the same window rows.
+        return self._TREE_SUB_POOLS.get(component.name, "swa")
 
     def _band(self, sub_pool: str):
         if sub_pool == "swa":

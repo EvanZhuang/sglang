@@ -560,7 +560,7 @@ class MambaComponent(TreeComponent):
         """The storage whose state this component's values are, and the
         sub-pool they are slots of."""
         storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(self.component_type.name)
+        return storage, storage.tree_sub_pool(self.component_type)
 
     @property
     def quantizes_checkpoints(self) -> bool:
